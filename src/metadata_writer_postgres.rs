@@ -535,6 +535,12 @@ impl MetadataWriter for PostgresMetadataWriter {
         snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
+        // Multicatalog Postgres finalizes the column generation in
+        // `begin_write_transaction` (column visibility is gated by the deferred
+        // `ducklake_catalog_snapshot_map` head row, not `end_snapshot`), so the
+        // commit point does not re-stamp columns.
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
     ) -> Result<i64> {
         block_on(async {
             // Single atomic commit: retire the prior generation (Replace), insert
@@ -568,11 +574,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             let row_id_start: i64 = stats_row.try_get(0)?;
 
-            let row = sqlx::query(
+            sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -582,9 +588,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            let id: i64 = row.try_get(0)?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -608,11 +613,18 @@ impl MetadataWriter for PostgresMetadataWriter {
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;
-            Ok(id)
+            Ok(snapshot_id)
         })
     }
 
-    fn publish_snapshot(&self, table_id: i64, snapshot_id: i64, mode: WriteMode) -> Result<()> {
+    fn publish_snapshot(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        mode: WriteMode,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<()> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
