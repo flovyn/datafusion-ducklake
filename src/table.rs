@@ -587,7 +587,12 @@ impl DuckLakeTable {
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups);
+                    .with_file_groups(file_groups)
+                    // FileRowNumberExec seeds row positions from the scan
+                    // partition index, so each partition must read exactly
+                    // its configured row-group chunk. DF 54's shared work
+                    // queue can otherwise let sibling partitions steal chunks.
+                    .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -917,7 +922,12 @@ impl DuckLakeTable {
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups);
+                    .with_file_groups(file_groups)
+                    // FileRowNumberExec seeds row positions from the scan
+                    // partition index, so each partition must read exactly
+                    // its configured row-group chunk. DF 54's shared work
+                    // queue can otherwise let sibling partitions steal chunks.
+                    .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(parquet_projection))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
