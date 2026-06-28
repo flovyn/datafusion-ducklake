@@ -43,8 +43,8 @@ This is a correctness bug, not a performance bug.
 Match DuckDB/DuckLake semantics: derive positions from Parquet physical row order, not from
 DataFusion arrival order.
 
-DataFusion 54 still does not expose a reader-level `file_row_number` column like DuckDB, so the
-pragmatic fix is:
+DataFusion 54 does not expose a reader-level `file_row_number` column like DuckDB, so the pragmatic
+fix is:
 
 1. Control the scan shape for positional paths.
 2. Emit a physical-position column immediately above the scan.
