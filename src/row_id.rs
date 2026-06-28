@@ -32,7 +32,6 @@
 //! `DuckLakeTable` reads the embedded column directly via the parquet scan and
 //! renames it. See `table.rs::build_exec_for_file_with_rowid`.
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -137,10 +136,6 @@ impl DisplayAs for FileRowNumberExec {
 impl ExecutionPlan for FileRowNumberExec {
     fn name(&self) -> &str {
         "FileRowNumberExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -314,10 +309,6 @@ impl DisplayAs for RowIdExec {
 impl ExecutionPlan for RowIdExec {
     fn name(&self) -> &str {
         "RowIdExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

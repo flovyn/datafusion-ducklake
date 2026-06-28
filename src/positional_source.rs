@@ -20,7 +20,6 @@
 //!
 //! [`ParquetSource`]: datafusion::datasource::physical_plan::ParquetSource
 
-use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -67,10 +66,6 @@ impl FileSource for PositionalFileSource {
     ) -> DataFusionResult<Arc<dyn FileOpener>> {
         self.inner
             .create_file_opener(object_store, base_config, partition)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn table_schema(&self) -> &TableSchema {

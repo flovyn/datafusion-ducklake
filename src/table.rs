@@ -1,6 +1,5 @@
 //! DuckLake table provider implementation
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -791,7 +790,7 @@ impl DuckLakeTable {
                 pf = pf.with_metadata_size_hint(hint);
             }
             if let Some(plan) = access {
-                pf = pf.with_extensions(Arc::new(plan));
+                pf = pf.with_extension(plan);
             }
             pf
         };
@@ -998,10 +997,6 @@ impl DuckLakeTable {
 
 #[async_trait]
 impl TableProvider for DuckLakeTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

@@ -5,7 +5,6 @@
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -150,10 +149,6 @@ impl DisplayAs for AppendCDCColumnsExec {
 impl ExecutionPlan for AppendCDCColumnsExec {
     fn name(&self) -> &str {
         "AppendCDCColumnsExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -523,10 +518,6 @@ impl TableChangesTable {
 
 #[async_trait]
 impl TableProvider for TableChangesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }

@@ -9,7 +9,6 @@
 //! 3. Read the data file and return only the rows at the newly deleted positions
 //! 4. Append CDC columns (snapshot_id, change_type='delete')
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -215,10 +214,6 @@ impl TableDeletionsTable {
 
 #[async_trait]
 impl TableProvider for TableDeletionsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -351,10 +346,6 @@ impl DisplayAs for DeletedRowsExec {
 impl ExecutionPlan for DeletedRowsExec {
     fn name(&self) -> &str {
         "DeletedRowsExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
