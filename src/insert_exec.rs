@@ -4,7 +4,6 @@
 //! - Collects all batches into memory before writing (no streaming yet)
 //! - Single partition only (partition 0)
 
-use std::any::Any;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
@@ -105,10 +104,6 @@ impl DisplayAs for DuckLakeInsertExec {
 impl ExecutionPlan for DuckLakeInsertExec {
     fn name(&self) -> &str {
         "DuckLakeInsertExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

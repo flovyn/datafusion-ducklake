@@ -8,7 +8,6 @@
 //! partitioned or merged. The position column is passed through unchanged for
 //! any downstream consumer (e.g. `RowIdExec`); the final projection drops it.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -78,10 +77,6 @@ impl DisplayAs for DeleteFilterExec {
 impl ExecutionPlan for DeleteFilterExec {
     fn name(&self) -> &str {
         "DeleteFilterExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

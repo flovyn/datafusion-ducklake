@@ -1,6 +1,5 @@
 //! DuckLake catalog provider implementation
 
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::Result;
@@ -158,10 +157,6 @@ impl DuckLakeCatalog {
 }
 
 impl CatalogProvider for DuckLakeCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         // Start with information_schema
         let mut names = vec!["information_schema".to_string()];

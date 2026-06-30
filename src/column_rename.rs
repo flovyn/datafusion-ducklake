@@ -5,7 +5,6 @@
 //! This is needed when columns have been renamed in DuckLake metadata but the
 //! Parquet files still have the original column names.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -77,10 +76,6 @@ impl DisplayAs for ColumnRenameExec {
 impl ExecutionPlan for ColumnRenameExec {
     fn name(&self) -> &str {
         "ColumnRenameExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

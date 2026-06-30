@@ -25,7 +25,6 @@
 //! SELECT * FROM ducklake.information_schema.tables WHERE schema_name = 'public';
 //! ```
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -82,10 +81,6 @@ impl SnapshotsTable {
 
 #[async_trait::async_trait]
 impl TableProvider for SnapshotsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -177,10 +172,6 @@ impl SchemataTable {
 
 #[async_trait::async_trait]
 impl TableProvider for SchemataTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -288,10 +279,6 @@ impl TablesTable {
 
 #[async_trait::async_trait]
 impl TableProvider for TablesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -395,10 +382,6 @@ impl ColumnsTable {
 
 #[async_trait::async_trait]
 impl TableProvider for ColumnsTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -564,10 +547,6 @@ impl TableInfoTable {
 
 #[async_trait::async_trait]
 impl TableProvider for TableInfoTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -677,10 +656,6 @@ impl FilesTable {
 
 #[async_trait::async_trait]
 impl TableProvider for FilesTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -724,10 +699,6 @@ impl InformationSchemaProvider {
 
 #[async_trait::async_trait]
 impl SchemaProvider for InformationSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         vec![
             "snapshots".to_string(),

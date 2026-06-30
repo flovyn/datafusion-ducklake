@@ -1,6 +1,5 @@
 //! DuckLake schema provider implementation
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -111,10 +110,6 @@ impl DuckLakeSchema {
 
 #[async_trait]
 impl SchemaProvider for DuckLakeSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         // Use cached snapshot_id
         self.provider

@@ -1,6 +1,5 @@
 //! DuckLake table provider implementation
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -588,7 +587,12 @@ impl DuckLakeTable {
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups);
+                    .with_file_groups(file_groups)
+                    // FileRowNumberExec seeds row positions from the scan
+                    // partition index, so each partition must read exactly
+                    // its configured row-group chunk. DF 54's shared work
+                    // queue can otherwise let sibling partitions steal chunks.
+                    .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -791,7 +795,7 @@ impl DuckLakeTable {
                 pf = pf.with_metadata_size_hint(hint);
             }
             if let Some(plan) = access {
-                pf = pf.with_extensions(Arc::new(plan));
+                pf = pf.with_extension(plan);
             }
             pf
         };
@@ -918,7 +922,12 @@ impl DuckLakeTable {
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                    .with_file_groups(file_groups);
+                    .with_file_groups(file_groups)
+                    // FileRowNumberExec seeds row positions from the scan
+                    // partition index, so each partition must read exactly
+                    // its configured row-group chunk. DF 54's shared work
+                    // queue can otherwise let sibling partitions steal chunks.
+                    .with_partitioned_by_file_group(true);
             builder = builder.with_projection_indices(Some(parquet_projection))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -998,10 +1007,6 @@ impl DuckLakeTable {
 
 #[async_trait]
 impl TableProvider for DuckLakeTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
