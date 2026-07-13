@@ -223,13 +223,48 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         partition: &crate::partition::PartitionSpec,
     ) -> Result<WriteResult> {
+        if partition.is_empty() {
+            return self.write_table(schema_name, table_name, batches).await;
+        }
+        self.write_partitioned(schema_name, table_name, batches, partition, WriteMode::Replace)
+            .await
+    }
+
+    /// Append batches to a partitioned table, keeping existing data. Like
+    /// [`append_table`](Self::append_table), but each distinct partition value
+    /// becomes one data file carrying its recorded partition value — so incremental
+    /// rows land in their partitions (skippable by a later scan) without rewriting
+    /// the existing files. An empty spec falls back to
+    /// [`append_table`](Self::append_table).
+    pub async fn append_table_partitioned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+        partition: &crate::partition::PartitionSpec,
+    ) -> Result<WriteResult> {
+        if partition.is_empty() {
+            return self.append_table(schema_name, table_name, batches).await;
+        }
+        self.write_partitioned(schema_name, table_name, batches, partition, WriteMode::Append)
+            .await
+    }
+
+    /// Shared partitioned-write body: split by partition, stage one file per
+    /// distinct value, and commit the spec + files in one atomic snapshot under
+    /// `mode`. `Replace` retires the prior data generation; `Append` keeps it.
+    async fn write_partitioned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+        partition: &crate::partition::PartitionSpec,
+        mode: WriteMode,
+    ) -> Result<WriteResult> {
         if batches.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "No batches to write".to_string(),
             ));
-        }
-        if partition.is_empty() {
-            return self.write_table(schema_name, table_name, batches).await;
         }
 
         let arrow_schema = batches[0].schema();
@@ -238,7 +273,7 @@ impl DuckLakeTableWriter {
             schema_name,
             table_name,
             &columns,
-            WriteMode::Replace,
+            mode,
         )?;
         let schema_with_ids = Arc::new(build_schema_with_field_ids(
             &arrow_schema,
@@ -315,7 +350,7 @@ impl DuckLakeTableWriter {
             setup.snapshot_id,
             &partition_spec,
             &files,
-            WriteMode::Replace,
+            mode,
             setup.base_snapshot_id,
             &columns,
             &setup.column_ids,

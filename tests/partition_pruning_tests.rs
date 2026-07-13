@@ -295,3 +295,87 @@ async fn pruned_query_matches_full_scan_baseline() {
     assert_eq!(ids.values(), &[1, 4]);
     assert_eq!(amounts.values(), &[100, 400]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn append_partitioned_keeps_existing_files_and_lands_new_partition_values() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = Arc::new(LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+
+    // Baseline: 5 rows across US/EU/AP → three data files.
+    table_writer
+        .write_table_partitioned(
+            "main",
+            "orders",
+            &[orders_batch()],
+            &PartitionSpec::identity(["region"]),
+        )
+        .await
+        .unwrap();
+
+    // Append two US rows and one new-region LA row: one new file per appended
+    // distinct value (US, LA), the three baseline files left in place.
+    let append = RecordBatch::try_new(
+        orders_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![6, 7, 8])),
+            Arc::new(StringArray::from(vec!["US", "US", "LA"])),
+            Arc::new(Int64Array::from(vec![600, 700, 800])),
+        ],
+    )
+    .unwrap();
+    let result = table_writer
+        .append_table_partitioned(
+            "main",
+            "orders",
+            &[append],
+            &PartitionSpec::identity(["region"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, 3);
+    assert_eq!(result.files_written, 2, "one appended file per distinct region (US, LA)");
+
+    // Append keeps the prior generation: 3 baseline + 2 appended = 5 live files
+    // (a Replace would have retired the baseline three).
+    let conn_str = format!("sqlite:{}", temp_dir.path().join("test.db").display());
+    let pool = sqlx::SqlitePool::connect(&conn_str).await.unwrap();
+    let live_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_files, 5, "baseline files kept, appended files added");
+
+    // US now spans two files (one baseline, one appended); every row reads back.
+    let us_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_file_partition_value WHERE partition_value = 'US'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(us_files, 2, "US spans a baseline and an appended file");
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(read_catalog(&temp_dir).await));
+    let rows = ctx
+        .sql("SELECT id FROM test.main.orders ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = rows
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8], "baseline + appended rows");
+}
