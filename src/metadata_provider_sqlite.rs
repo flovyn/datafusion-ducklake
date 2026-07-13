@@ -190,7 +190,39 @@ impl MetadataProvider for SqliteMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>> {
         block_on(async {
-            let rows = sqlx::query(
+            // Backward compatibility: minimal / pre-v1.0 catalogs may lack the
+            // `partial_max` column and the `ducklake_schema_versions` ledger.
+            // Detect both and degrade those projections to NULL so plain reads
+            // still work (both are consumed only by compaction; `partial_max`
+            // also by time-travel reads of partial files, which such catalogs
+            // never contain).
+            let has_partial_max: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partial_max'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let has_schema_versions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'ducklake_schema_versions'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let partial_max_expr = if has_partial_max > 0 {
+                "data.partial_max"
+            } else {
+                "NULL"
+            };
+            let schema_version_expr = if has_schema_versions > 0 {
+                "(SELECT sv.schema_version
+                  FROM ducklake_schema_versions sv
+                  WHERE sv.table_id = data.table_id
+                    AND sv.begin_snapshot <= data.begin_snapshot
+                  ORDER BY sv.begin_snapshot DESC
+                  LIMIT 1)"
+            } else {
+                "NULL"
+            };
+            let sql = format!(
                 "SELECT
                     data.data_file_id,
                     data.path AS data_file_path,
@@ -206,7 +238,10 @@ impl MetadataProvider for SqliteMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.begin_snapshot AS data_begin_snapshot,
+                    {partial_max_expr} AS data_partial_max,
+                    {schema_version_expr} AS data_schema_version
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -215,16 +250,17 @@ impl MetadataProvider for SqliteMetadataProvider {
                     AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
                 WHERE data.table_id = ?
                   AND ? >= data.begin_snapshot
-                  AND (? < data.end_snapshot OR data.end_snapshot IS NULL)",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                  AND (? < data.end_snapshot OR data.end_snapshot IS NULL)"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -261,6 +297,9 @@ impl MetadataProvider for SqliteMetadataProvider {
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
+                        begin_snapshot: row.try_get(15)?,
+                        schema_version: row.try_get(17)?,
+                        partial_max: row.try_get(16)?,
                         max_row_count: record_count,
                         delete_count,
                     })
@@ -609,6 +648,9 @@ impl MetadataProvider for SqliteMetadataProvider {
                             delete_file,
                             row_id_start: None,
                             snapshot_id: None,
+                            begin_snapshot: None,
+                            schema_version: None,
+                            partial_max: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
                         },
