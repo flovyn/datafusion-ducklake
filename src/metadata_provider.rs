@@ -510,6 +510,23 @@ pub struct DuckLakeTableFile {
     /// when there is no visible delete file. Net live rows for this file are
     /// `max_row_count - delete_count`.
     pub delete_count: Option<i64>,
+    /// This file's identity partition values as `(partition_key_index, value)`
+    /// pairs (`value = None` is a NULL partition value). Empty when the file is
+    /// unpartitioned. Populated from `ducklake_file_partition_value`; the scan
+    /// path uses it to skip whole files whose value a predicate excludes.
+    pub partition_values: Vec<(i64, Option<String>)>,
+}
+
+/// One partition key of a table's partition spec: which table column it
+/// partitions on (by `column_id`) and the transform, at a given key position.
+#[derive(Debug, Clone)]
+pub struct DuckLakePartitionColumn {
+    /// Position of this key in the partition spec (0-based).
+    pub key_index: i64,
+    /// Catalog `column_id` of the partitioned table column.
+    pub column_id: i64,
+    /// Transform name (`"identity"`, …).
+    pub transform: String,
 }
 
 impl DuckLakeTableFile {
@@ -526,6 +543,7 @@ impl DuckLakeTableFile {
             snapshot_id: None,
             max_row_count: None,
             delete_count: None,
+            partition_values: Vec::new(),
         }
     }
 }
@@ -603,7 +621,17 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>>;
-    //     todo: support select with file pruning
+
+    /// The table's partition spec at `snapshot_id` (its partition keys in key
+    /// order), or an empty vec when the table is unpartitioned. Backends that
+    /// don't record partitioning return empty (no whole-file partition pruning).
+    fn get_partition_columns(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<DuckLakePartitionColumn>> {
+        Ok(Vec::new())
+    }
 
     /// Net number of live rows in a table at a snapshot, accounting for delete
     /// files: `SUM(record_count) - SUM(delete_count)` over the files visible at

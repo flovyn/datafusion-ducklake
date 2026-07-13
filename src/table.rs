@@ -9,6 +9,7 @@ use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
 };
+use crate::partition::PartitionTransform;
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
 use crate::row_id::{
@@ -156,6 +157,10 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
     table_files: Vec<DuckLakeTableFile>,
+    /// Partition keys as `(partition_key_index, column_name, data_type, transform)`,
+    /// in key order. Empty when the table is unpartitioned. Used to prune whole
+    /// files by partition value at scan time.
+    partition_columns: Vec<(i64, String, DataType, PartitionTransform)>,
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
@@ -185,6 +190,38 @@ impl std::fmt::Debug for DuckLakeTable {
     }
 }
 
+/// Load a table's partition keys as `(key_index, column_name, data_type,
+/// transform)`, resolving each partition `column_id` to its column name and Arrow
+/// type. Unknown transforms and columns missing from the schema are skipped. Empty
+/// for unpartitioned tables.
+fn load_partition_columns(
+    provider: &dyn MetadataProvider,
+    table_id: i64,
+    snapshot_id: i64,
+    columns: &[DuckLakeTableColumn],
+    schema: &SchemaRef,
+) -> Result<Vec<(i64, String, DataType, PartitionTransform)>> {
+    let spec = provider.get_partition_columns(table_id, snapshot_id)?;
+    let mut out = Vec::with_capacity(spec.len());
+    for key in spec {
+        let Some(transform) = PartitionTransform::from_catalog_str(&key.transform) else {
+            continue;
+        };
+        let Some(name) = columns
+            .iter()
+            .find(|c| c.column_id == key.column_id)
+            .map(|c| c.column_name.clone())
+        else {
+            continue;
+        };
+        let Ok(field) = schema.field_with_name(&name) else {
+            continue;
+        };
+        out.push((key.key_index, name, field.data_type().clone(), transform));
+    }
+    Ok(out)
+}
+
 impl DuckLakeTable {
     /// Create a new DuckLake table
     pub fn new(
@@ -200,6 +237,8 @@ impl DuckLakeTable {
         let physical_schema = Arc::new(build_arrow_schema(&columns)?);
         let schema = physical_schema.clone();
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
+        let partition_columns =
+            load_partition_columns(provider.as_ref(), table_id, snapshot_id, &columns, &schema)?;
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
@@ -240,6 +279,7 @@ impl DuckLakeTable {
             row_lineage: false,
             columns,
             table_files,
+            partition_columns,
             #[cfg(feature = "encryption")]
             encryption_factory,
             file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
@@ -248,6 +288,56 @@ impl DuckLakeTable {
             #[cfg(feature = "write")]
             writer: None,
         })
+    }
+
+    /// Data files that survive partition pruning against `filters`: every file
+    /// whose partition value no predicate provably excludes. Unpartitioned tables
+    /// or empty filters keep all files. DataFusion re-applies the filters after
+    /// the scan (Inexact pushdown), so pruning only ever removes files that cannot
+    /// match.
+    fn pruned_files(&self, filters: &[Expr]) -> Vec<&DuckLakeTableFile> {
+        if self.partition_columns.is_empty() || filters.is_empty() {
+            return self.table_files.iter().collect();
+        }
+        self.table_files
+            .iter()
+            .filter(|tf| {
+                let values = self.file_partition_values(tf);
+                crate::partition::file_matches_filters(&values, filters)
+            })
+            .collect()
+    }
+
+    /// Resolve one file's partition values into a `column name -> value` map,
+    /// each typed and tagged with its transform, ready for predicate evaluation.
+    fn file_partition_values(
+        &self,
+        file: &DuckLakeTableFile,
+    ) -> HashMap<String, crate::partition::FilePartitionValue> {
+        let mut values = HashMap::with_capacity(self.partition_columns.len());
+        for (key_index, name, data_type, transform) in &self.partition_columns {
+            let raw = file
+                .partition_values
+                .iter()
+                .find(|(idx, _)| idx == key_index)
+                .and_then(|(_, value)| value.as_deref());
+            let scalar = crate::partition::catalog_value_to_scalar(raw, *transform, data_type);
+            values.insert(
+                name.clone(),
+                crate::partition::FilePartitionValue {
+                    transform: *transform,
+                    value: scalar,
+                },
+            );
+        }
+        values
+    }
+
+    /// Number of data files a scan would open for `filters` after partition
+    /// pruning. Exposed for measuring whole-file skip: compare against the count
+    /// for an empty filter set (all files).
+    pub fn plan_file_count(&self, filters: &[Expr]) -> usize {
+        self.pruned_files(filters).len()
     }
 
     /// Enable / disable the row-lineage feature. When enabled, the table's
@@ -1169,13 +1259,16 @@ impl TableProvider for DuckLakeTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        // Filters are received here for informational purposes. DataFusion's optimizer
-        // automatically pushes them down to the Parquet scanner for row group pruning and
-        // page-level filtering since we declared support via supports_filters_pushdown().
-        // We mark them as Inexact, so DataFusion will reapply them after our scan.
-        _filters: &[Expr],
+        // Filters drive two prunings. Whole-file skip by identity partition value
+        // happens here (`pruned_files`), before any file is opened. The surviving
+        // files still receive the filters via the Parquet scanner for row-group /
+        // page / bloom pruning. All filters are Inexact, so DataFusion re-applies
+        // them after our scan — coarse pruning stays correct.
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let kept = self.pruned_files(filters);
+
         // Row-lineage detour: when the synthetic `rowid` column is projected,
         // every file needs its own scan because each has a distinct
         // `row_id_start`. `projection == None` with row lineage on means "all
@@ -1194,7 +1287,7 @@ impl TableProvider for DuckLakeTable {
                 .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
 
             let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            for tf in &self.table_files {
+            for &tf in &kept {
                 let exec = self
                     .build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
                     .await?;
@@ -1212,10 +1305,8 @@ impl TableProvider for DuckLakeTable {
 
         // Fast path: rowid not projected. All projection indices refer to
         // physical columns, so the existing logic works untouched.
-        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
-            .table_files
-            .iter()
-            .partition(|tf| tf.delete_file.is_some());
+        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
+            kept.into_iter().partition(|tf| tf.delete_file.is_some());
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 

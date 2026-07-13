@@ -223,6 +223,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         snapshot_id: Some(snapshot_id),
                         max_row_count: record_count,
                         delete_count,
+                        partition_values: Vec::new(),
                     })
                 },
             )?
@@ -421,6 +422,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             snapshot_id: None,
                             max_row_count,
                             delete_count: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 },

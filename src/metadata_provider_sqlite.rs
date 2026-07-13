@@ -2,9 +2,9 @@
 
 use crate::Result;
 use crate::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileWithTable, MetadataProvider, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
+    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakePartitionColumn,
+    DuckLakeTableColumn, DuckLakeTableFile, FileWithTable, MetadataProvider, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
     reconstruct_list_columns_with_table,
 };
 use sqlx::Row;
@@ -220,6 +220,28 @@ impl MetadataProvider for SqliteMetadataProvider {
             .fetch_all(&self.pool)
             .await?;
 
+            // Per-file identity partition values, keyed by data_file_id. Empty
+            // for unpartitioned tables. Fetched once and attached below.
+            let value_rows = sqlx::query(
+                "SELECT data_file_id, partition_key_index, partition_value
+                 FROM ducklake_file_partition_value
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut values_by_file: std::collections::HashMap<i64, Vec<(i64, Option<String>)>> =
+                std::collections::HashMap::new();
+            for row in value_rows {
+                let data_file_id: i64 = row.try_get(0)?;
+                let key_index: i64 = row.try_get(1)?;
+                let value: Option<String> = row.try_get(2)?;
+                values_by_file
+                    .entry(data_file_id)
+                    .or_default()
+                    .push((key_index, value));
+            }
+
             rows.into_iter()
                 .map(|row| {
                     let data_file = DuckLakeFileData {
@@ -248,8 +270,14 @@ impl MetadataProvider for SqliteMetadataProvider {
                         (None, None)
                     };
 
+                    let data_file_id: i64 = row.try_get(0)?;
+                    let partition_values = values_by_file
+                        .get(&data_file_id)
+                        .cloned()
+                        .unwrap_or_default();
+
                     Ok(DuckLakeTableFile {
-                        data_file_id: row.try_get(0)?,
+                        data_file_id,
                         file: data_file,
                         delete_file_id: row.try_get(8)?,
                         delete_file,
@@ -257,6 +285,41 @@ impl MetadataProvider for SqliteMetadataProvider {
                         snapshot_id: Some(snapshot_id),
                         max_row_count: record_count,
                         delete_count,
+                        partition_values,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_partition_columns(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakePartitionColumn>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT pc.partition_key_index, pc.column_id, pc.transform
+                 FROM ducklake_partition_column AS pc
+                 JOIN ducklake_partition_info AS pi
+                     ON pc.partition_id = pi.partition_id
+                 WHERE pi.table_id = ?
+                   AND ? >= pi.begin_snapshot
+                   AND (? < pi.end_snapshot OR pi.end_snapshot IS NULL)
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakePartitionColumn {
+                        key_index: row.try_get(0)?,
+                        column_id: row.try_get(1)?,
+                        transform: row.try_get(2)?,
                     })
                 })
                 .collect()
@@ -511,6 +574,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                             snapshot_id: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 })

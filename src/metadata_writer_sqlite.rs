@@ -118,8 +118,37 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     record_count INTEGER,
     row_id_start INTEGER,
     mapping_id INTEGER,
+    partition_id INTEGER,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
+);
+
+-- Partition metadata (DuckLake spec). `ducklake_partition_info` is the versioned
+-- spec header (one live row per partitioned table), `ducklake_partition_column`
+-- names each partition key (column + transform) in key order, and
+-- `ducklake_file_partition_value` records each data file's value per key. Only
+-- the identity transform is written today. Unpartitioned tables have no rows in
+-- any of these, and DuckDB reads the same layout it writes.
+CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+    partition_id INTEGER PRIMARY KEY,
+    table_id INTEGER NOT NULL,
+    begin_snapshot INTEGER NOT NULL,
+    end_snapshot INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+    partition_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    partition_key_index INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    transform VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+    data_file_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    partition_key_index INTEGER NOT NULL,
+    partition_value VARCHAR
 );
 
 -- Per-table row-lineage counter (DuckLake spec). `next_row_id` is the
@@ -1382,6 +1411,153 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+
+            let schema_id: i64 =
+                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_partitioned_data_files(
+        &self,
+        table_id: i64,
+        // SQLite created the schema/table at begin; names unused (trait parity).
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        partition_columns: &[(i64, String)],
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        block_on(async {
+            // Single atomic commit: finalize the snapshot / column generation
+            // (retiring the prior data generation for Replace), record the
+            // partition spec, then insert every partition file with its values
+            // and advance the row-lineage counter — so the head only ever
+            // resolves to the complete partitioned generation.
+            let mut tx = self.pool.begin().await?;
+
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
+
+            // Retire the prior partition spec and record the new one. The data
+            // generation was already retired by finalize_snapshot (Replace);
+            // ending the prior spec in the same snapshot keeps them in lockstep.
+            sqlx::query(
+                "UPDATE ducklake_partition_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let partition_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_partition_info (table_id, begin_snapshot)
+                 VALUES (?, ?) RETURNING partition_id",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+
+            for (key_index, (column_id, transform)) in partition_columns.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO ducklake_partition_column
+                         (partition_id, table_id, partition_key_index, column_id, transform)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .bind(key_index as i64)
+                .bind(*column_id)
+                .bind(transform.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Seed the stats row for the Append path (Replace already seeded it
+            // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            for file in files {
+                let row_id_start: i64 =
+                    sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                        .bind(table_id)
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get(0)?;
+
+                let data_file_id: i64 = sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, partition_id, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                )
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(row_id_start)
+                .bind(partition_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get(0)?;
+
+                for (key_index, value) in file.partition_values.iter().enumerate() {
+                    sqlx::query(
+                        "INSERT INTO ducklake_file_partition_value
+                             (data_file_id, table_id, partition_key_index, partition_value)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(key_index as i64)
+                    .bind(value.as_deref())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET next_row_id     = next_row_id + ?,
+                         record_count    = record_count + ?,
+                         file_size_bytes = file_size_bytes + ?
+                     WHERE table_id = ?",
+                )
+                .bind(file.record_count)
+                .bind(file.record_count)
+                .bind(file.file_size_bytes)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")

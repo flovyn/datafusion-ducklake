@@ -175,6 +175,10 @@ pub struct DataFileInfo {
     pub footer_size: Option<i64>,
     /// Number of records in the file
     pub record_count: i64,
+    /// Identity partition value of each partition key, in key order. `None`
+    /// entries are NULL partition values. Empty when the table is not
+    /// partitioned. Recorded in `ducklake_file_partition_value`.
+    pub partition_values: Vec<Option<String>>,
 }
 
 impl DataFileInfo {
@@ -197,6 +201,7 @@ impl DataFileInfo {
             file_size_bytes,
             footer_size: None,
             record_count,
+            partition_values: Vec::new(),
         }
     }
 
@@ -209,6 +214,13 @@ impl DataFileInfo {
     /// Mark this file as having an absolute path.
     pub fn with_absolute_path(mut self) -> Self {
         self.path_is_relative = false;
+        self
+    }
+
+    /// Attach the file's identity partition values (one per partition key, in
+    /// key order; `None` = NULL).
+    pub fn with_partition_values(mut self, values: Vec<Option<String>>) -> Self {
+        self.partition_values = values;
         self
     }
 }
@@ -445,6 +457,41 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(
             "set_delete_file is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Register a set of partition data files AND the partition spec they were
+    /// written against, publishing the snapshot as the catalog head, atomically.
+    ///
+    /// Like [`register_data_file`](MetadataWriter::register_data_file) but for a
+    /// partitioned write: it records the partition spec
+    /// (`ducklake_partition_info` + `ducklake_partition_column`), inserts every
+    /// file in `files` (each stamped with the spec's `partition_id`), and writes
+    /// each file's `partition_values` to `ducklake_file_partition_value` — all in
+    /// one transaction, so the head only ever resolves to the full partitioned
+    /// generation. For `Replace`, the prior generation and any prior partition
+    /// spec are retired in the same commit.
+    ///
+    /// `partition_columns` is `(column_id, transform)` per partition key, in key
+    /// order; each file's `DataFileInfo::partition_values` is aligned to it.
+    ///
+    /// Default: unsupported; backends override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_partitioned_data_files(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _partition_columns: &[(i64, String)],
+        _files: &[DataFileInfo],
+        _mode: WriteMode,
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "register_partitioned_data_files is not supported by this metadata writer".to_string(),
         ))
     }
 

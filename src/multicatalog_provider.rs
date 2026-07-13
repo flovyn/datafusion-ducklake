@@ -323,6 +323,7 @@ impl MetadataProvider for MulticatalogProvider {
                         snapshot_id: Some(snapshot_id),
                         max_row_count: record_count,
                         delete_count,
+                        partition_values: Vec::new(),
                     })
                 })
                 .collect()
@@ -595,6 +596,7 @@ impl MetadataProvider for MulticatalogProvider {
                             snapshot_id: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 })

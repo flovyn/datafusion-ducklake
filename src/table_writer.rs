@@ -211,6 +211,177 @@ impl DuckLakeTableWriter {
         })
     }
 
+    /// Write batches to a table partitioned by `partition`, replacing any existing
+    /// data. Each distinct partition value (after the key's transform) becomes one
+    /// data file, and its recorded value lets a later scan skip the file when a
+    /// predicate excludes it. The partition spec and every file commit in one atomic
+    /// snapshot. An empty spec falls back to [`write_table`](Self::write_table).
+    pub async fn write_table_partitioned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+        partition: &crate::partition::PartitionSpec,
+    ) -> Result<WriteResult> {
+        if batches.is_empty() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "No batches to write".to_string(),
+            ));
+        }
+        if partition.is_empty() {
+            return self.write_table(schema_name, table_name, batches).await;
+        }
+
+        let arrow_schema = batches[0].schema();
+        let columns = arrow_schema_to_column_defs(&arrow_schema)?;
+        let setup = self.metadata.begin_write_transaction(
+            schema_name,
+            table_name,
+            &columns,
+            WriteMode::Replace,
+        )?;
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(
+            &arrow_schema,
+            &setup.column_ids,
+        ));
+
+        // Resolve each partition column to its physical index (for splitting) and
+        // catalog column_id + transform (for the recorded spec). A temporal
+        // transform requires a date/timestamp column.
+        let mut partition_indices = Vec::with_capacity(partition.columns.len());
+        let mut transforms = Vec::with_capacity(partition.columns.len());
+        let mut partition_spec = Vec::with_capacity(partition.columns.len());
+        for key in &partition.columns {
+            let idx = arrow_schema.index_of(&key.column_name).map_err(|_| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "partition column '{}' is not in the table schema",
+                    key.column_name
+                ))
+            })?;
+            if key.transform.is_temporal()
+                && !crate::partition::is_temporal_type(arrow_schema.field(idx).data_type())
+            {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "partition transform '{}' requires a date/timestamp column, but '{}' is {:?}",
+                    key.transform.as_catalog_str(),
+                    key.column_name,
+                    arrow_schema.field(idx).data_type()
+                )));
+            }
+            partition_indices.push(idx);
+            transforms.push(key.transform);
+            partition_spec.push((
+                setup.column_ids[idx],
+                key.transform.as_catalog_str().to_string(),
+            ));
+        }
+
+        // One data file per distinct partition value.
+        let groups = crate::partition::split_by_partition(
+            &arrow_schema,
+            batches,
+            &partition_indices,
+            &transforms,
+        )?;
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+
+        let mut files = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let partition_values = group
+                .key
+                .iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .and_then(crate::partition::scalar_to_catalog_value)
+                })
+                .collect::<Vec<_>>();
+            let file_info = self
+                .stage_partition_file(&table_key, schema_with_ids.clone(), &group.batch)
+                .await?
+                .with_partition_values(partition_values);
+            files.push(file_info);
+        }
+
+        let records_written: i64 = files.iter().map(|f| f.record_count).sum();
+        let committed = self.metadata.register_partitioned_data_files(
+            setup.table_id,
+            schema_name,
+            table_name,
+            setup.snapshot_id,
+            &partition_spec,
+            &files,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )?;
+
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: files.len(),
+            records_written,
+        })
+    }
+
+    /// Stage one partition's rows to a fresh parquet file under `table_key`,
+    /// upload it, and return the relative [`DataFileInfo`] to register (partition
+    /// values attached by the caller). Mirrors the staging/upload that a streaming
+    /// session's `finish` does, for a batch already grouped by partition.
+    async fn stage_partition_file(
+        &self,
+        table_key: &str,
+        schema_with_ids: SchemaRef,
+        batch: &RecordBatch,
+    ) -> Result<DataFileInfo> {
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let object_path_str = join_paths(table_key, &file_name)?;
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+        let mut props_builder = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression);
+        if let Some(rows) = self.max_row_group_rows {
+            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
+        }
+        if let Some(bytes) = self.max_row_group_bytes {
+            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
+        }
+        let props = props_builder.build();
+
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+        let batch_with_ids = RecordBatch::try_new(schema_with_ids, batch.columns().to_vec())?;
+        writer.write(&batch_with_ids)?;
+
+        let staged = writer.into_inner()?;
+        let mut file = staged
+            .into_inner()
+            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+        let file_size = file.metadata()?.len() as i64;
+        let footer_size = read_footer_size(&mut file)?;
+
+        let local = tokio::fs::File::open(temp.path()).await?;
+        let mut reader = tokio::io::BufReader::new(local);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+            let _ = upload.abort().await;
+            return Err(e.into());
+        }
+
+        Ok(
+            DataFileInfo::new(&file_name, file_size, batch.num_rows() as i64)
+                .with_footer_size(footer_size),
+        )
+    }
+
     /// Write batches to a table, replacing any existing data.
     pub async fn write_table(
         &self,
