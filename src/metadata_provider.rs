@@ -654,6 +654,15 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(net.max(0) as u64)
     }
 
+    /// The live key/value tags on an object (a `table_id`) at `snapshot_id`,
+    /// in insertion order — spec-native `ducklake_tag`. Snapshot-scoped
+    /// (`snapshot_id >= begin_snapshot AND (snapshot_id < end_snapshot OR
+    /// end_snapshot IS NULL)`), matching columns and partition specs. Backends
+    /// that don't model tags return empty.
+    fn get_table_tags(&self, _object_id: i64, _snapshot_id: i64) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     // Dynamic lookup methods for on-demand metadata retrieval
 
     /// Get schema by name for a specific snapshot

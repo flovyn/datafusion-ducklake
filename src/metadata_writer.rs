@@ -524,6 +524,22 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Replace the full set of key/value tags on an object (a `table_id`) at the
+    /// current catalog head — spec-native `ducklake_tag`. In one transaction:
+    /// retire every live tag on the object (`end_snapshot` = head) and insert
+    /// `tags` as the new live set (`begin_snapshot` = head, `end_snapshot` NULL),
+    /// so a read at head returns exactly `tags` and a read at an older snapshot
+    /// returns that snapshot's set. No new snapshot is created — the tags describe
+    /// the generation already at the head. Full replace semantics: a key absent
+    /// from `tags` is dropped, matching a full-refresh write.
+    ///
+    /// Default: unsupported; backends that model tags override it.
+    fn set_table_tags(&self, _object_id: i64, _tags: &[(String, String)]) -> Result<()> {
+        Err(DuckLakeError::InvalidConfig(
+            "set_table_tags is not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// End all existing data files for a table. Returns count of files ended.
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64>;
 

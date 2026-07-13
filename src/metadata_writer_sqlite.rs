@@ -191,6 +191,20 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     path_is_relative BOOLEAN NOT NULL DEFAULT 1,
     schedule_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Per-object key/value tags (DuckLake spec `ducklake_tag`): user metadata attached
+-- to an object — a `ducklake_table.table_id` here — versioned by
+-- `[begin_snapshot, end_snapshot)` exactly like `ducklake_column` and
+-- `ducklake_schema`. A caller persists a table's property map (e.g. lineage edges
+-- and version identity) so a materialized table is self-describing, and DuckDB reads
+-- the same layout it writes. `end_snapshot` NULL marks the live generation.
+CREATE TABLE IF NOT EXISTS ducklake_tag (
+    object_id BIGINT NOT NULL,
+    begin_snapshot BIGINT NOT NULL,
+    end_snapshot BIGINT,
+    key VARCHAR NOT NULL,
+    value VARCHAR
+);
 "#;
 
 /// SQLite-based metadata writer for DuckLake catalogs.
@@ -1792,6 +1806,47 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn set_table_tags(&self, object_id: i64, tags: &[(String, String)]) -> Result<()> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Stamp against the current head; the tags describe the generation
+            // already published, so no snapshot is created here.
+            let head_row =
+                sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let head: i64 = head_row.try_get(0)?;
+
+            // Full replace: retire every live tag on the object, then insert the
+            // new set. A key absent from `tags` is left retired (dropped).
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ?
+                 WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(head)
+            .bind(object_id)
+            .execute(&mut *tx)
+            .await?;
+
+            for (key, value) in tags {
+                sqlx::query(
+                    "INSERT INTO ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value)
+                     VALUES (?, ?, NULL, ?, ?)",
+                )
+                .bind(object_id)
+                .bind(head)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
@@ -2042,6 +2097,68 @@ mod tests {
             .await
             .unwrap();
         (writer, temp_dir)
+    }
+
+    /// `ducklake_tag` round-trips through the writer and provider: the exact set
+    /// written is read back at head, a re-write fully replaces it (dropped keys
+    /// disappear), and an older snapshot still sees its own set (time travel).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_tags_round_trip_replace_and_time_travel() {
+        use crate::metadata_provider::MetadataProvider;
+        use crate::metadata_provider_sqlite::SqliteMetadataProvider;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("tags.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+        let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+        let object_id = 1;
+
+        // Head at the first generation; persist a property set.
+        let first = writer.create_snapshot().unwrap();
+        writer
+            .set_table_tags(
+                object_id,
+                &[
+                    ("lineage".to_string(), "orders<-raw".to_string()),
+                    ("version".to_string(), "7".to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            provider.get_table_tags(object_id, first).unwrap(),
+            vec![
+                ("lineage".to_string(), "orders<-raw".to_string()),
+                ("version".to_string(), "7".to_string()),
+            ],
+            "exact tag set read back at head, in insertion order"
+        );
+
+        // A new generation with a fully different set: the old keys are dropped.
+        let second = writer.create_snapshot().unwrap();
+        writer
+            .set_table_tags(object_id, &[("version".to_string(), "8".to_string())])
+            .unwrap();
+        assert_eq!(
+            provider.get_table_tags(object_id, second).unwrap(),
+            vec![("version".to_string(), "8".to_string())],
+            "full replace: 'lineage' is gone, 'version' updated"
+        );
+
+        // Time travel: the first generation still sees its own set.
+        assert_eq!(
+            provider.get_table_tags(object_id, first).unwrap(),
+            vec![
+                ("lineage".to_string(), "orders<-raw".to_string()),
+                ("version".to_string(), "7".to_string()),
+            ],
+            "reading at the first snapshot returns the first set"
+        );
+
+        // A different object is unaffected.
+        assert!(provider.get_table_tags(2, second).unwrap().is_empty());
     }
 
     /// An existing user's catalog (legacy `column_id INTEGER PRIMARY KEY`) must be

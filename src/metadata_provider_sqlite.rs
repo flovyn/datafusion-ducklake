@@ -326,6 +326,30 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn get_table_tags(&self, object_id: i64, snapshot_id: i64) -> Result<Vec<(String, String)>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT key, value FROM ducklake_tag
+                 WHERE object_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY rowid",
+            )
+            .bind(object_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    let value: Option<String> = row.try_get(1)?;
+                    Ok((row.try_get(0)?, value.unwrap_or_default()))
+                })
+                .collect()
+        })
+    }
+
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
         block_on(async {
             let row = sqlx::query(
